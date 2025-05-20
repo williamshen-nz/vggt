@@ -1,10 +1,14 @@
 """Modified from https://github.com/facebookresearch/vggt/blob/main/demo_gradio.py"""
 
 import glob
+import json
 import os
+import shutil
 import time
+from pathlib import Path
 from typing import List, Tuple
 
+import cv2
 import numpy as np
 import torch
 from evo.core.geometry import umeyama_alignment
@@ -241,6 +245,102 @@ def demo():
         )
         rr.log(f"cam/polycam/{idx:03d}", [rr.components.AxisLength(0.1)])
 
+    # Hack around with intrinsics to apply scale and make sure point cloud is still aligned
+    depth_map = predictions["depth"].cpu().numpy()[0].copy()
+    depth_map *= s
+    vggt_new_w2cs = np.linalg.inv(vggt_aligned_c2ws)
+    scaled_points = unproject_depth_map_to_point_map(
+        depth_map,
+        vggt_new_w2cs,
+        predictions["intrinsic"].cpu().numpy()[0],
+    )
+    images = predictions["images"][0]
+    if images.ndim == 4 and images.shape[1] == 3:  # NCHW format
+        colors_rgb = images.permute(0, 2, 3, 1)  # NHWC format
+    else:
+        colors_rgb = images
+    colors_rgb = colors_rgb.reshape(-1, 3) * 255
+    colors_rgb = colors_rgb.to(torch.uint8)
+    scaled_rgbs = colors_rgb
+
+    scaled_points = scaled_points.reshape(-1, 3)
+    scaled_points = torch.tensor(scaled_points, device=device)
+
+    conf = predictions["depth_conf"]
+    conf = conf.reshape(-1)
+    conf_threshold = torch.quantile(conf, 0.0)
+    conf_mask = (conf >= conf_threshold) & (conf > 1e-5)
+
+    scaled_points = scaled_points[conf_mask]
+    scaled_rgbs = scaled_rgbs[conf_mask]
+
+    down_pts, down_rgbs = voxel_downsample_with_colors(
+        scaled_points, scaled_rgbs, voxel_size=voxel_size
+    )
+    rr.log(
+        "scaled_pcd",
+        rr.Points3D(positions=down_pts.cpu(), colors=down_rgbs.cpu(), radii=voxel_size / 2),
+    )
+
+    out_dir = Path("/tmp/vggt_out")
+
+    images_dir = out_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    depth_dir = out_dir / "depth"
+    depth_dir.mkdir(parents=True, exist_ok=True)
+
+    transforms = {"frames": []}
+    scaled_depth_maps = depth_map
+    intrinsics = predictions["intrinsic"].cpu().numpy()[0]
+
+    rgbs = predictions["images"][0].cpu().numpy()
+
+    for src_path, rgb, depth, c2w, intrinsic in zip(image_paths, rgbs, scaled_depth_maps, vggt_aligned_c2ws, intrinsics):
+        dst_path = images_dir / Path(src_path).name
+        # Explicit copy
+        # shutil.copy(src_path, dst_path)
+        rgb = rgb.transpose(1, 2, 0)
+        rgb_255 = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+        # it's a RGB not BGR
+        bgr = cv2.cvtColor(rgb_255, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(str(dst_path), bgr)
+
+        depth_path = depth_dir / Path(src_path).name
+        # replace extension with png
+        depth_path = depth_path.with_suffix(".png")
+        depth_rel_path = depth_path.relative_to(out_dir)
+
+        # Multiply by 1000 to convert to meters then uint16
+        depth_map_uint16 = (depth * 1000.0).astype(np.uint16)
+        # Save depth map as uint16 png
+        cv2.imwrite(str(depth_path), depth_map_uint16)
+
+        dst_rel_path = dst_path.relative_to(out_dir)
+        frame = {
+            "file_path": str(dst_rel_path),
+            "depth_file_path": str(depth_rel_path),
+            "transform_matrix": c2w.tolist(),
+            "intrinsic_matrix": intrinsic.tolist(),
+        }
+        transforms["frames"].append(frame)
+
+    conf_raw = predictions["depth_conf"][0].cpu().numpy()
+    # Convert to float16
+    # conf_raw = conf_raw.astype(np.float16)
+
+    # Save as np array
+    conf_raw_path = out_dir / "depth_conf.npy"
+    np.save(str(conf_raw_path), conf_raw)
+
+    transforms["depth_confidence_path"] = str(conf_raw_path)
+
+    with open(out_dir / "transforms.json", "w") as f:
+        json.dump(transforms, f, indent=2)
+
+
+
+    print()
 
 if __name__ == "__main__":
     demo()
