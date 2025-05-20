@@ -3,19 +3,30 @@
 import glob
 import os
 import time
+from typing import List, Tuple
 
 import numpy as np
 import torch
+from evo.core.geometry import umeyama_alignment
+from polyform.core.capture_folder import CaptureFolder
+from tqdm import tqdm
 
 from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from will_utils import (
+    voxel_downsample_with_colors,
+    process_frame,
+    get_point_cloud_for_frame,
+)
+
+import rerun as rr
+
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 if not torch.cuda.is_available():
     raise ValueError("CUDA is not available. Please run on a machine with a GPU.")
-
 
 print("Initializing and loading VGGT model...")
 model = VGGT()
@@ -24,137 +35,208 @@ model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
 model.eval().to(device)
 print(f"VGGT model loaded successfully to {device}")
 
-image_dir = "/home/wilshen/datasets/feijoa/teddy_v1/keyframes/images"  # replace with your actual path
-image_paths = sorted(glob.glob(os.path.join(image_dir, "*.jpg")))
 
-# Load and preprocess images
-torch.cuda.empty_cache()
-img_tensor = load_and_preprocess_images(sorted(image_paths)).to(device)
-print(f"Loaded images to tensor of shape {img_tensor.shape}")
+def vggt_inference(image_paths: List[str]) -> dict:
+    # Load and preprocess images
+    torch.cuda.empty_cache()
+    img_tensor = load_and_preprocess_images(sorted(image_paths)).to(device)
+    print(f"Loaded images to tensor of shape {img_tensor.shape}")
 
-# Forward pass
-print("Running inference...")
-dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-torch.cuda.synchronize()
-start_time = time.perf_counter()
-with torch.no_grad(), torch.autocast(device_type="cuda", dtype=dtype):
-    predictions = model(img_tensor)
-forward_dur = time.perf_counter() - start_time
-print(f"Inference completed in {forward_dur:.2f}s")
+    # Forward pass
+    print("Running inference...")
+    dtype = (
+        torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    )
+    torch.cuda.synchronize()
+    start_time = time.perf_counter()
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=dtype):
+        predictions = model(img_tensor)
+    forward_dur = time.perf_counter() - start_time
+    print(f"Inference completed in {forward_dur:.2f}s")
 
-# Convert pose encoding to extrinsic and intrinsic matrices
-print("Converting pose encoding to extrinsic and intrinsic matrices...")
-extrinsic, intrinsic = pose_encoding_to_extri_intri(
-    predictions["pose_enc"], img_tensor.shape[-2:]
-)
-predictions["extrinsic"] = extrinsic
-predictions["intrinsic"] = intrinsic
+    # Convert pose encoding to extrinsic and intrinsic matrices
+    print("Converting pose encoding to extrinsic and intrinsic matrices...")
+    extrinsic, intrinsic = pose_encoding_to_extri_intri(
+        predictions["pose_enc"], img_tensor.shape[-2:]
+    )
+    predictions["extrinsic"] = extrinsic
+    predictions["intrinsic"] = intrinsic
 
-# NOTE: this is HELLA slow
-# Convert tensors to numpy
-# for key in predictions:
-#     if isinstance(predictions[key], torch.Tensor):
-#         predictions[key] = predictions[key].cpu().numpy().squeeze(0).tolist()
+    # NOTE: this is HELLA slow so avoid
+    # Convert tensors to numpy
+    # for key in predictions:
+    #     if isinstance(predictions[key], torch.Tensor):
+    #         predictions[key] = predictions[key].cpu().numpy().squeeze(0).tolist()
 
-# Generate world points from depth map
-print("Computing world points from depth map...")
-depth_map = predictions["depth"].cpu().numpy()[0]
-world_points = unproject_depth_map_to_point_map(
-    depth_map,
-    predictions["extrinsic"].cpu().numpy()[0],
-    predictions["intrinsic"].cpu().numpy()[0],
-)
-predictions["world_points_from_depth"] = world_points
-
-conf_thresh = 30.0
-
-images = predictions["images"][0]
-if images.ndim == 4 and images.shape[1] == 3:  # NCHW format
-    colors_rgb = images.permute(0, 2, 3, 1)  # NHWC format
-else:
-    colors_rgb = images
-colors_rgb = colors_rgb.reshape(-1, 3) * 255
-colors_rgb = colors_rgb.to(torch.uint8)
-
-# Pointmap branch
-world_points = predictions["world_points"]
-world_points_conf = predictions["world_points_conf"]
-
-points = world_points.reshape(-1, 3)
-points_conf = world_points_conf.reshape(-1)
-
-# conf_threshold = np.percentile(points_conf, conf_thresh)
-# use torch equivalent
-conf_threshold = torch.quantile(points_conf, conf_thresh / 100.0)
-
-conf_mask = (points_conf >= conf_threshold) & (points_conf > 1e-5)
-print("Number of points above confidence threshold:", conf_mask.sum())
-
-good_points = points[conf_mask]
-good_rgbs = colors_rgb[conf_mask]
-assert good_points.shape == good_rgbs.shape
-
-import rerun as rr
-
-rr.init("vggt", spawn=True)
-rr.log("pcd", rr.Points3D(positions=good_points.cpu(), colors=good_rgbs.cpu()))
-
-for image in predictions["images"][0]:
-    chw = image
-    hwc = image.permute(2, 1, 0)
-    rr.log("image", rr.Image(hwc.cpu()))
-# Depthmap and camera branch
+    # Generate world points from depth map
+    print("Computing world points from depth map...")
+    depth_map = predictions["depth"].cpu().numpy()[0]
+    world_points = unproject_depth_map_to_point_map(
+        depth_map,
+        predictions["extrinsic"].cpu().numpy()[0],
+        predictions["intrinsic"].cpu().numpy()[0],
+    )
+    predictions["world_points_from_depth"] = world_points
+    return predictions
 
 
-def voxel_downsample_with_colors(
-    points: torch.Tensor, colors: torch.Tensor, voxel_size: float
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Downsample a point cloud using a voxel grid. Averages both point positions and colors.
+def get_point_cloud(
+    predictions: dict, conf_percentile: float
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Extract and reshape colors
+    images = predictions["images"][0]
+    if images.ndim == 4 and images.shape[1] == 3:  # NCHW format
+        colors_rgb = images.permute(0, 2, 3, 1)  # NHWC format
+    else:
+        colors_rgb = images
+    colors_rgb = colors_rgb.reshape(-1, 3) * 255
+    colors_rgb = colors_rgb.to(torch.uint8)
 
-    Args:
-        points: (N, 3) float tensor of point coordinates.
-        colors: (N, 3) uint8 or float tensor of RGB values in [0, 255] or [0, 1].
-        voxel_size: float voxel resolution.
+    # Pointmap branch
+    world_points = predictions["world_points"]
+    world_points_conf = predictions["world_points_conf"]
 
-    Returns:
-        downsampled_points: (M, 3) float tensor of averaged point positions.
-        downsampled_colors: (M, 3) uint8 tensor of averaged colors.
-    """
-    assert points.shape[0] == colors.shape[0]
-    assert voxel_size > 0
+    points = world_points.reshape(-1, 3)
+    points_conf = world_points_conf.reshape(-1)
 
-    if colors.dtype != torch.float32:
-        colors = colors.float()
-
-    voxel_min_bound = points.amin(dim=0) - voxel_size * 0.5
-    ref_coords = (points - voxel_min_bound) / voxel_size
-    voxel_indices = torch.floor(ref_coords).long()
-
-    unique_indices, inverse_indices = torch.unique(
-        voxel_indices, dim=0, return_inverse=True
+    conf_threshold = torch.quantile(points_conf, conf_percentile / 100.0)
+    conf_mask = (points_conf >= conf_threshold) & (points_conf > 1e-5)
+    print(
+        "Number of points above confidence threshold:",
+        conf_mask.sum(),
+        "/",
+        len(points_conf),
     )
 
-    num_voxels = unique_indices.shape[0]
-    point_sum = torch.zeros((num_voxels, 3), dtype=points.dtype, device=points.device)
-    color_sum = torch.zeros((num_voxels, 3), dtype=colors.dtype, device=colors.device)
-    counts = torch.zeros(num_voxels, dtype=torch.int64, device=points.device)
-
-    point_sum.scatter_add_(0, inverse_indices.unsqueeze(1).expand(-1, 3), points)
-    color_sum.scatter_add_(0, inverse_indices.unsqueeze(1).expand(-1, 3), colors)
-    counts.scatter_add_(0, inverse_indices, torch.ones_like(inverse_indices))
-
-    downsampled_points = point_sum / counts.unsqueeze(1)
-    downsampled_colors = (color_sum / counts.unsqueeze(1)).clamp(0, 255).to(torch.uint8)
-
-    return downsampled_points, downsampled_colors
+    good_points = points[conf_mask]
+    good_rgbs = colors_rgb[conf_mask]
+    assert good_points.shape == good_rgbs.shape
+    return good_points, good_rgbs
 
 
-good_point_down, good_color_down = voxel_downsample_with_colors(
-    good_points, good_rgbs, voxel_size=0.02
-)
+def apply_similarity_transform_to_poses_vec(
+    poses: np.ndarray, R: np.ndarray, t: np.ndarray, s: float
+) -> np.ndarray:
+    # Extract rotations and translations
+    R_pred = poses[:, :3, :3]  # (N, 3, 3)
+    t_pred = poses[:, :3, 3]  # (N, 3)
 
-rr.log(
-    "pcd_downsampled",
-    rr.Points3D(positions=good_point_down.cpu(), colors=good_color_down.cpu()),
-)
+    # Apply rotation: R @ R_pred
+    R_new = R @ R_pred  # (3, 3) @ (N, 3, 3) = (N, 3, 3)
+
+    # Apply scaling and translation to translation vectors
+    t_new = s * (R @ t_pred.T).T + t  # (N, 3)
+
+    # Assemble new poses
+    aligned = np.zeros_like(poses)
+    aligned[:, :3, :3] = R_new
+    aligned[:, :3, 3] = t_new
+    aligned[:, 3, 3] = 1.0
+    return aligned
+
+
+def get_polycam_pcd(frames):
+    pts = []
+    rgbs = []
+    for frame in tqdm(frames):
+        new_points, new_colors = get_point_cloud_for_frame(frame)
+        pts.append(new_points)
+        rgbs.append(new_colors)
+    pts = np.concatenate(pts, axis=0)
+    rgbs = np.concatenate(rgbs, axis=0)
+    return pts, rgbs
+
+
+def demo():
+    rr.init("vggt", spawn=True)
+    polycam_dataset = "/home/wilshen/datasets/feijoa/baymax_v1"
+    image_dir = os.path.join(polycam_dataset, "keyframes/images")
+    image_paths = sorted(glob.glob(os.path.join(image_dir, "*.jpg")))
+
+    folder = CaptureFolder(polycam_dataset)
+    keyframes = folder.get_keyframes(rotate=True)
+    frames = [process_frame(kf) for kf in keyframes]
+    assert image_paths == [f["rgb_path"] for f in frames]
+
+    predictions = vggt_inference(image_paths)
+
+    points, rgbs = get_point_cloud(predictions, conf_percentile=60.0)
+    # rr.log("vggt_pcd", rr.Points3D(positions=points.cpu(), colors=rgbs.cpu()))
+
+    # Get predicted extrinsics and align with polycam extrinsics
+    vggt_extrinsics = torch.eye(4)[None].repeat(len(image_paths), 1, 1)
+    vggt_extrinsics[:, :3, :4] = predictions["extrinsic"][0]
+    vggt_c2ws = torch.linalg.inv(vggt_extrinsics)
+
+    polycam_c2ws = np.array([f["c2w"] for f in frames])
+    polycam_c2ws = torch.tensor(polycam_c2ws, device=device)
+
+    vggt_xyz = vggt_c2ws[:, :3, 3]
+    polycam_xyz = polycam_c2ws[:, :3, 3]
+
+    R, t, s = umeyama_alignment(
+        x=vggt_xyz.T.cpu().numpy(),
+        y=polycam_xyz.T.cpu().numpy(),
+        with_scale=True,
+    )
+
+    # Align the VGGT-predicted poses to the Polycam poses
+    vggt_aligned_c2ws = apply_similarity_transform_to_poses_vec(
+        poses=vggt_c2ws.cpu().numpy(),
+        R=R,
+        t=t,
+        s=s,
+    )
+    assert vggt_aligned_c2ws.shape == polycam_c2ws.shape
+
+    # Transform the point cloud
+    points_np = points.cpu().numpy()
+    points_transformed = s * (points_np @ R.T) + t
+    points_transformed = torch.tensor(points_transformed, device=points.device)
+
+    # Downsample point cloud
+    voxel_size = 0.02
+    points_d, rgbs_d = voxel_downsample_with_colors(
+        points_transformed, rgbs, voxel_size=voxel_size
+    )
+    rr.log(
+        "vggt_pcd",
+        rr.Points3D(
+            positions=points_d.cpu(), colors=rgbs_d.cpu(), radii=voxel_size / 2
+        ),
+    )
+
+    polycam_pts, polycam_rgbs = get_polycam_pcd(frames)
+    polycam_pts = torch.tensor(polycam_pts, device=device)
+    polycam_rgbs = torch.tensor(polycam_rgbs, device=device)
+    polycam_pts_d, polycam_rgbs_d = voxel_downsample_with_colors(
+        polycam_pts, polycam_rgbs, voxel_size=voxel_size
+    )
+    rr.log(
+        "polycam_pcd",
+        rr.Points3D(
+            positions=polycam_pts_d.cpu(),
+            colors=polycam_rgbs_d.cpu(),
+            radii=voxel_size / 2,
+        ),
+    )
+
+    for idx, (vggt_c2w, polycam_c2w) in enumerate(
+        zip(vggt_aligned_c2ws, polycam_c2ws.cpu())
+    ):
+        rr.set_time(timeline="step", sequence=idx)
+        rr.log(
+            f"cam/vggt/{idx:03d}",
+            rr.Transform3D(translation=vggt_c2w[:3, 3], mat3x3=vggt_c2w[:3, :3]),
+        )
+        rr.log(f"pred_cam/{idx:03d}", [rr.components.AxisLength(0.1)])
+
+        rr.log(
+            f"cam/polycam/{idx:03d}",
+            rr.Transform3D(translation=polycam_c2w[:3, 3], mat3x3=polycam_c2w[:3, :3]),
+        )
+        rr.log(f"cam/polycam/{idx:03d}", [rr.components.AxisLength(0.1)])
+
+
+if __name__ == "__main__":
+    demo()
