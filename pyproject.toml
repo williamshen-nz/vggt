@@ -1,6 +1,9 @@
 [project]
 authors = [{name = "Jianyuan Wang", email = "jianyuan@robots.ox.ac.uk"}]
 dependencies = [
+    "fastapi",
+    "python-multipart",
+    "uvicorn",
     "numpy<2",
     "Pillow",
     "huggingface_hub",
