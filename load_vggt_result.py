@@ -35,7 +35,7 @@ def downsample_point_cloud(points, colors, voxel_size: float):
 
 
 def load(conf_percent: float = 50.0, voxel_size: float = 0.02):
-    out_dir = Path("/tmp/vggt_out")
+    out_dir = Path("/home/wilshen/workspace/vggt/server/results/2025-05-20_15-53-32/outputs")
 
     transforms_path = out_dir / "transforms.json"
     with open(transforms_path, "r") as f:
@@ -62,7 +62,7 @@ def load(conf_percent: float = 50.0, voxel_size: float = 0.02):
         )
 
     # Load confidence
-    confidence_path = transforms["depth_confidence_path"]
+    confidence_path = out_dir / transforms["depth_confidence_path"]
     confidence = np.load(confidence_path)
 
     # Convert to point cloud
