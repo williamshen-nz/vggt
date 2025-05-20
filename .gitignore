@@ -148,3 +148,9 @@ skyseg.onnx
 # pixi environments
 .pixi
 *.egg-info
+
+# Jetbrains
+.idea/
+
+# Uploaded images
+/inputs_images*/
