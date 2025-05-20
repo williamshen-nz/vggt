@@ -96,6 +96,10 @@ def get_point_cloud(
     world_points = predictions["world_points"]
     world_points_conf = predictions["world_points_conf"]
 
+    # Depthmap and camera branch
+    world_points = torch.tensor(predictions["world_points_from_depth"], device=device)
+    world_points_conf = predictions["depth_conf"]
+
     points = world_points.reshape(-1, 3)
     points_conf = world_points_conf.reshape(-1)
 
@@ -160,7 +164,7 @@ def demo():
 
     predictions = vggt_inference(image_paths)
 
-    points, rgbs = get_point_cloud(predictions, conf_percentile=60.0)
+    points, rgbs = get_point_cloud(predictions, conf_percentile=70.0)
     # rr.log("vggt_pcd", rr.Points3D(positions=points.cpu(), colors=rgbs.cpu()))
 
     # Get predicted extrinsics and align with polycam extrinsics
@@ -224,7 +228,7 @@ def demo():
     for idx, (vggt_c2w, polycam_c2w) in enumerate(
         zip(vggt_aligned_c2ws, polycam_c2ws.cpu())
     ):
-        rr.set_time(timeline="step", sequence=idx)
+        # rr.set_time(timeline="step", sequence=idx)
         rr.log(
             f"cam/vggt/{idx:03d}",
             rr.Transform3D(translation=vggt_c2w[:3, 3], mat3x3=vggt_c2w[:3, :3]),
