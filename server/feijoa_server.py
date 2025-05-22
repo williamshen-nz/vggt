@@ -11,10 +11,24 @@ import numpy as np
 import torch
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import FileResponse
+from starlette.middleware.cors import CORSMiddleware
 
 from server.vggt_inference import get_vggt_model, vggt_inference
 
 app = FastAPI()
+
+origins = [
+    "*"                            # WARNING: use "*" only for public APIs
+]
+
+# Add the middleware to your app
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,              # allows specific origins
+    allow_credentials=True,             # allows cookies, authorization headers, etc.
+    allow_methods=["*"],                # allows all HTTP methods (GET, POST, etc.)
+    allow_headers=["*"],                # allows all headers
+)
 
 results_dir = Path(__file__).parent / "results"
 results_dir.mkdir(exist_ok=True)
